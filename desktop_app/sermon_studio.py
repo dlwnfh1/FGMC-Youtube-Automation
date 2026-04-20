@@ -57,6 +57,10 @@ def resolve_project_dir() -> Path:
     if not getattr(sys, "frozen", False):
         return APP_DIR.parent
 
+    package_dir = APP_DIR / "FGMC-Youtube-Automation-package"
+    if APP_DIR.name.lower() == "dist" and package_dir.exists():
+        return package_dir
+
     # For the installed/portable EXE, keep all data next to the EXE so the package
     # can be copied to another computer without accidentally using a parent folder.
     return APP_DIR
@@ -1952,7 +1956,8 @@ class SermonStudioEngine:
             raise ValueError("End time must be after start time.")
 
         ffmpeg_bin = resolve_binary("ffmpeg", ffmpeg_path)
-        destination = EXPORTS_DIR / f"{slugify(title or 'sermon')}.mp4"
+        output_name = title.strip() or source_file.stem or "sermon"
+        destination = EXPORTS_DIR / f"{slugify(output_name)}.mp4"
         duration_seconds = end_seconds - start_seconds
         fade_out_seconds = 0.0
         if fade_out_enabled:
@@ -2044,7 +2049,7 @@ class SermonStudioEngine:
         video_kbps = max(300, total_kbps - audio_kbps)
         if video_kbps <= 300 and total_kbps <= audio_kbps + 300:
             self.log(
-                f"Target size {target_mb:g}MB is very small for {format_seconds(duration_seconds)}; "
+                f"Target size {target_mb:g}MB is very small for {format_timestamp(duration_seconds)}; "
                 "using minimum video bitrate."
             )
 
@@ -2995,9 +3000,10 @@ class MainWindow(QMainWindow):
     def _do_export(self):
         if not self.current_source_file:
             raise ValueError("Download the full video first.")
+        export_title = self.title_edit.text().strip() or self.current_source_file.stem
         return self.engine.export_clip(
             source_file=self.current_source_file,
-            title=self.title_edit.text().strip(),
+            title=export_title,
             start_text=self.start_edit.text().strip(),
             end_text=self.end_edit.text().strip(),
             ffmpeg_path=self.engine.get_setting("ffmpeg_path"),
