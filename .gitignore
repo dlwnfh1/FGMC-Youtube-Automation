@@ -9,6 +9,11 @@ automation/exports/
 desktop_app_data/
 desktop_app/__pycache__/
 tools/
+client_secret*.json
+*oauth*.json
+*credentials*.json
+*token*.json
+settings.json
 *.spec
 *.pyc
 *.pyo

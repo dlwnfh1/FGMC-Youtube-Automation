@@ -425,6 +425,8 @@ class YouTubeLiveCandidate:
     title: str
     actual_end_time: str
     processing_status: str
+    download_ready: bool
+    ready_reason: str
 
     @property
     def url(self) -> str:
@@ -562,73 +564,139 @@ class SermonStudioEngine:
 
         service = self.get_youtube_service()
         label = "1부" if service_order == "first" else "2부"
+        title_marker = "1부 예배" if service_order == "first" else "2부 예배"
         self.status(f"Finding recent completed live archive for {label}...")
         self.progress(None)
 
-        response = service.liveBroadcasts().list(
-            part="id,snippet,status",
-            mine=True,
-            broadcastStatus="completed",
+        response = service.search().list(
+            part="id,snippet",
+            forMine=True,
+            type="video",
+            order="date",
             maxResults=10,
         ).execute()
-        items = response.get("items", [])
-        if len(items) < 1:
-            raise RuntimeError("완료된 라이브 방송을 찾지 못했습니다.")
+        search_items = response.get("items", [])
+        video_ids: list[str] = []
+        for item in search_items:
+            item_id = item.get("id", {})
+            video_id = str(item_id.get("videoId", "") if isinstance(item_id, dict) else item_id).strip()
+            if video_id:
+                video_ids.append(video_id)
+        if not video_ids:
+            raise RuntimeError("최근 YouTube 영상을 찾지 못했습니다.")
 
-        def sort_key(item: dict[str, Any]) -> datetime:
-            snippet = item.get("snippet", {})
-            return self._parse_youtube_time(
-                snippet.get("actualEndTime")
-                or snippet.get("actualStartTime")
-                or snippet.get("scheduledStartTime")
-                or snippet.get("publishedAt")
-                or ""
-            )
+        video_response = service.videos().list(
+            part="snippet,liveStreamingDetails,processingDetails,status",
+            id=",".join(video_ids),
+        ).execute()
+        live_items = []
+        for item in video_response.get("items", []):
+            live_details = item.get("liveStreamingDetails", {})
+            item_title = str(item.get("snippet", {}).get("title", ""))
+            if live_details.get("actualEndTime") and title_marker in item_title:
+                live_items.append(item)
+        if len(live_items) < 1:
+            raise RuntimeError(f"최근 영상 중 제목에 '{title_marker}'가 들어간 완료된 라이브 아카이브를 찾지 못했습니다.")
 
-        items.sort(key=sort_key, reverse=True)
-        index = 1 if service_order == "first" else 0
-        if len(items) <= index:
-            raise RuntimeError(f"{label} 예배 후보를 찾기에는 완료된 라이브가 부족합니다.")
+        live_items.sort(
+            key=lambda item: self._parse_youtube_time(
+                item.get("liveStreamingDetails", {}).get("actualEndTime", "")
+            ),
+            reverse=True,
+        )
+        index = 0
 
-        selected = items[index]
+        selected = live_items[index]
         video_id = str(selected.get("id", "")).strip()
         snippet = selected.get("snippet", {})
+        live_details = selected.get("liveStreamingDetails", {})
         title = str(snippet.get("title", "")).strip()
-        actual_end_time = str(
-            snippet.get("actualEndTime")
-            or snippet.get("actualStartTime")
-            or snippet.get("scheduledStartTime")
-            or ""
-        )
+        actual_end_time = str(live_details.get("actualEndTime", ""))
+        processing_status = str(selected.get("processingDetails", {}).get("processingStatus", "unknown"))
         if not video_id:
             raise RuntimeError("선택된 라이브에서 YouTube video ID를 찾지 못했습니다.")
-
-        processing_status = "unknown"
-        try:
-            video_response = service.videos().list(
-                part="processingDetails,status,snippet",
-                id=video_id,
-            ).execute()
-            video_items = video_response.get("items", [])
-            if video_items:
-                processing_status = str(
-                    video_items[0].get("processingDetails", {}).get("processingStatus", "unknown")
-                )
-        except Exception as exc:
-            self.log(f"Could not read YouTube processing status: {exc}")
+        download_ready, ready_reason = self.check_youtube_download_ready(
+            f"https://www.youtube.com/watch?v={video_id}",
+            processing_status,
+        )
 
         candidate = YouTubeLiveCandidate(
             video_id=video_id,
             title=title,
             actual_end_time=actual_end_time,
             processing_status=processing_status,
+            download_ready=download_ready,
+            ready_reason=ready_reason,
         )
         self.log(
             f"{label} live archive candidate: {candidate.url} | "
-            f"title={candidate.title} | processing={candidate.processing_status}"
+            f"title={candidate.title} | processing={candidate.processing_status} | "
+            f"download_ready={candidate.download_ready} ({candidate.ready_reason})"
         )
         self.progress(100, 100)
         return candidate
+
+    def check_youtube_download_ready(self, url: str, processing_status: str = "unknown") -> tuple[bool, str]:
+        normalized_status = (processing_status or "unknown").lower()
+        if normalized_status in {"processing", "pending"}:
+            return False, f"YouTube processing status is {processing_status}."
+        if normalized_status in {"failed", "terminated"}:
+            return False, f"YouTube processing status is {processing_status}."
+
+        yt_dlp_bin = resolve_binary("yt-dlp", self.get_setting("yt_dlp_path"))
+
+        def build_probe_command(browser: str = "") -> list[str]:
+            command = [
+                yt_dlp_bin,
+                "--ignore-config",
+                "--no-playlist",
+                "--skip-download",
+                "--dump-json",
+                "--extractor-args",
+                "youtube:player_client=android,web",
+            ]
+            if browser:
+                command.extend(["--cookies-from-browser", browser])
+            command.append(url)
+            return command
+
+        def needs_browser_cookies(error_text: str) -> bool:
+            lowered = error_text.lower()
+            return (
+                "sign in to confirm" in lowered
+                or "not a bot" in lowered
+                or "--cookies-from-browser" in lowered
+                or "cookies" in lowered
+            )
+
+        try:
+            completed = run_command_streaming(build_probe_command())
+        except RuntimeError as exc:
+            if not needs_browser_cookies(str(exc)):
+                return False, f"yt-dlp could not read downloadable metadata: {exc}"
+            last_error = exc
+            for browser in ["chrome", "edge", "firefox"]:
+                try:
+                    completed = run_command_streaming(build_probe_command(browser))
+                    break
+                except RuntimeError as retry_exc:
+                    last_error = retry_exc
+            else:
+                return False, f"YouTube login cookies are needed or locked: {last_error}"
+
+        try:
+            metadata = json.loads(completed.stdout)
+        except Exception:
+            return True, "yt-dlp can read the video metadata."
+
+        formats = metadata.get("formats", [])
+        downloadable_formats = [
+            item for item in formats
+            if item.get("url") and item.get("vcodec") != "none"
+        ]
+        if downloadable_formats:
+            return True, "yt-dlp found downloadable video formats."
+        return False, "yt-dlp metadata was found, but no downloadable video format was available yet."
 
     def set_callbacks(self, log_callback, status_callback, progress_callback) -> None:
         self.log = log_callback
@@ -655,9 +723,16 @@ class SermonStudioEngine:
         target_dir = DOWNLOADS_DIR / title_slug
         target_dir.mkdir(parents=True, exist_ok=True)
 
+        def is_finished_video(path: Path) -> bool:
+            return (
+                path.is_file()
+                and path.suffix.lower() in {".mp4", ".mkv", ".mov", ".webm", ".m4v"}
+                and not path.name.endswith((".part", ".ytdl", ".temp"))
+            )
+
         existing = sorted(
-            path for path in target_dir.glob("source.*")
-            if not path.name.endswith((".part", ".ytdl", ".temp"))
+            (path for path in target_dir.iterdir() if is_finished_video(path)),
+            key=lambda path: (0 if path.stem == "source" else 1, path.stat().st_mtime),
         )
         if existing:
             self.log(f"Reusing existing download: {existing[0]}")
@@ -665,7 +740,7 @@ class SermonStudioEngine:
             self.progress(100, 100)
             return DownloadResult(source_file=existing[0], title_slug=title_slug)
 
-        output_template = str(target_dir / "source.%(ext)s")
+        output_template = str(target_dir / "%(title).200s.%(ext)s")
         self.status("Downloading full service video...")
         self.progress(0, 100)
 
@@ -695,7 +770,7 @@ class SermonStudioEngine:
                 "-f",
                 "bv*[ext=mp4][vcodec^=avc1][height<=1080][fps<=60]+ba[ext=m4a]/b[ext=mp4][height<=1080]/b",
                 "-S",
-                "res:1080,fps,vcodec:h264,acodec:m4a",
+                "height:1080,res:1080,fps,br,vcodec:h264,acodec:m4a",
                 "--merge-output-format",
                 "mp4",
             ]
@@ -713,21 +788,25 @@ class SermonStudioEngine:
                 or "cookies" in lowered
             )
 
-        try:
-            completed = run_command_streaming(build_download_command(), handle_download_line)
-        except RuntimeError as exc:
-            if not needs_browser_cookies(str(exc)):
-                raise
-            last_error = exc
-            for browser in ["chrome", "edge", "firefox"]:
-                self.log(f"Download needs YouTube login cookies. Retrying with {browser} browser cookies...")
-                try:
-                    completed = run_command_streaming(build_download_command(browser), handle_download_line)
-                    break
-                except RuntimeError as retry_exc:
-                    last_error = retry_exc
-                    self.log(f"Retry with {browser} cookies failed: {retry_exc}")
-            else:
+        completed = None
+        cookie_errors: list[RuntimeError] = []
+        for browser in ["edge", "chrome", "firefox"]:
+            self.log(f"Trying download with {browser} browser cookies for best available quality...")
+            try:
+                completed = run_command_streaming(build_download_command(browser), handle_download_line)
+                break
+            except RuntimeError as retry_exc:
+                cookie_errors.append(retry_exc)
+                self.log(f"Download with {browser} cookies failed: {retry_exc}")
+
+        if completed is None:
+            self.log("Browser-cookie download did not work. Trying public YouTube formats as fallback...")
+            try:
+                completed = run_command_streaming(build_download_command(), handle_download_line)
+            except RuntimeError as exc:
+                if not needs_browser_cookies(str(exc)) and not cookie_errors:
+                    raise
+                last_error = cookie_errors[-1] if cookie_errors else exc
                 last_error_text = str(last_error)
                 if "could not copy chrome cookie database" in last_error_text.lower():
                     raise RuntimeError(
@@ -748,14 +827,38 @@ class SermonStudioEngine:
             self.log(completed.stdout.strip())
 
         downloaded = sorted(
-            path for path in target_dir.glob("source.*")
-            if not path.name.endswith((".part", ".ytdl", ".temp"))
+            (path for path in target_dir.iterdir() if is_finished_video(path)),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
         )
         if not downloaded:
             raise FileNotFoundError("Download finished but no source file was found.")
+        self.log_media_summary(downloaded[0], "Downloaded source", self.get_setting("ffmpeg_path"))
         self.status("Download completed.")
         self.progress(100, 100)
         return DownloadResult(source_file=downloaded[0], title_slug=title_slug)
+
+    def log_media_summary(self, source_file: Path, label: str, ffmpeg_path: str) -> None:
+        try:
+            ffprobe_bin = resolve_ffprobe(resolve_binary("ffmpeg", ffmpeg_path))
+            command = [
+                ffprobe_bin,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height,avg_frame_rate,bit_rate",
+                "-of",
+                "default=noprint_wrappers=1",
+                str(source_file),
+            ]
+            completed = run_command(command)
+            summary = " | ".join(line.strip() for line in completed.stdout.splitlines() if line.strip())
+            if summary:
+                self.log(f"{label}: {summary}")
+        except Exception as exc:
+            self.log(f"{label}: could not read media summary ({exc})")
 
     def extract_full_audio(self, source_file: Path, title_slug: str, ffmpeg_path: str) -> Path:
         ffmpeg_bin = resolve_binary("ffmpeg", ffmpeg_path)
@@ -1861,12 +1964,12 @@ class SermonStudioEngine:
         command = [
             ffmpeg_bin,
             "-y",
-            "-i",
-            str(source_file),
             "-ss",
             format_timestamp(start_seconds),
-            "-to",
-            format_timestamp(end_seconds),
+            "-i",
+            str(source_file),
+            "-t",
+            format_timestamp(duration_seconds),
         ]
         if fade_out_seconds > 0:
             fade_start = max(0.0, duration_seconds - fade_out_seconds)
@@ -2037,6 +2140,7 @@ class WorkerThread(QThread):
     progress = Signal(object, object)
     finished_ok = Signal(object)
     failed = Signal(str, str)
+    cancelled = Signal()
 
     def __init__(self, fn, *args, error_title="Error", **kwargs):
         super().__init__()
@@ -2048,8 +2152,14 @@ class WorkerThread(QThread):
     def run(self) -> None:
         try:
             result = self.fn(*self.args, **self.kwargs)
+            if self.isInterruptionRequested():
+                self.cancelled.emit()
+                return
             self.finished_ok.emit(result)
         except Exception as exc:
+            if self.isInterruptionRequested():
+                self.cancelled.emit()
+                return
             self.failed.emit(self.error_title, str(exc))
 
 
@@ -2195,9 +2305,13 @@ class MainWindow(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
+        self.stop_task_btn = QPushButton("현재 작업 멈추고 수동 입력")
+        self.stop_task_btn.setEnabled(False)
+        self.stop_task_btn.clicked.connect(self.stop_current_task_for_manual)
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
         self.manual_actions_widget: QWidget | None = None
+        self.manual_toggle_btn: QPushButton | None = None
 
         self._build_ui()
 
@@ -2224,25 +2338,15 @@ class MainWindow(QMainWindow):
         info_box.setLayout(info_form)
         main.addWidget(info_box)
 
-        live_row = QHBoxLayout()
-        find_first_live_btn = QPushButton("1부 예배 찾기")
-        find_second_live_btn = QPushButton("2부 예배 찾기")
-        find_first_live_btn.clicked.connect(lambda: self.find_live_archive("first"))
-        find_second_live_btn.clicked.connect(lambda: self.find_live_archive("second"))
-        live_row.addStretch(1)
-        live_row.addWidget(find_first_live_btn)
-        live_row.addWidget(find_second_live_btn)
-        live_row.addStretch(1)
-        main.addLayout(live_row)
-
         mode_row = QHBoxLayout()
-        auto_btn = QPushButton("자동 업로드")
-        manual_btn = QPushButton("수동 업로드")
-        auto_btn.setMinimumHeight(44)
-        auto_btn.setMinimumWidth(180)
-        manual_btn.setMinimumHeight(44)
-        manual_btn.setMinimumWidth(180)
-        auto_btn.setStyleSheet(
+        first_auto_btn = QPushButton("1부 자동화")
+        second_auto_btn = QPushButton("2부 자동화")
+        first_manual_btn = QPushButton("1부 수동 작업")
+        second_manual_btn = QPushButton("2부 수동 작업")
+        for button in [first_auto_btn, second_auto_btn, first_manual_btn, second_manual_btn]:
+            button.setMinimumHeight(44)
+            button.setMinimumWidth(160)
+        auto_style = (
             "QPushButton {"
             "background-color: #1f6f43; color: white; border: 0; border-radius: 8px;"
             "font-size: 16px; font-weight: 700; padding: 10px 24px;"
@@ -2250,7 +2354,7 @@ class MainWindow(QMainWindow):
             "QPushButton:hover { background-color: #258250; }"
             "QPushButton:pressed { background-color: #185735; }"
         )
-        manual_btn.setStyleSheet(
+        manual_style = (
             "QPushButton {"
             "background-color: #f2efe8; color: #29352b; border: 1px solid #c8c0b3; border-radius: 8px;"
             "font-size: 16px; font-weight: 700; padding: 10px 24px;"
@@ -2258,13 +2362,39 @@ class MainWindow(QMainWindow):
             "QPushButton:hover { background-color: #e7dfd2; }"
             "QPushButton:pressed { background-color: #d8cebf; }"
         )
-        auto_btn.clicked.connect(self.auto_upload)
-        manual_btn.clicked.connect(self.toggle_manual_upload)
+        first_auto_btn.setStyleSheet(auto_style)
+        second_auto_btn.setStyleSheet(auto_style)
+        first_manual_btn.setStyleSheet(manual_style)
+        second_manual_btn.setStyleSheet(manual_style)
+        first_auto_btn.clicked.connect(lambda: self.auto_service("first"))
+        second_auto_btn.clicked.connect(lambda: self.auto_service("second"))
+        first_manual_btn.clicked.connect(lambda: self.manual_service("first"))
+        second_manual_btn.clicked.connect(lambda: self.manual_service("second"))
         mode_row.addStretch(1)
-        mode_row.addWidget(auto_btn)
-        mode_row.addWidget(manual_btn)
+        mode_row.addWidget(first_auto_btn)
+        mode_row.addWidget(second_auto_btn)
+        mode_row.addWidget(first_manual_btn)
+        mode_row.addWidget(second_manual_btn)
         mode_row.addStretch(1)
         main.addLayout(mode_row)
+
+        manual_toggle_row = QHBoxLayout()
+        self.manual_toggle_btn = QPushButton("수동 메뉴 펼치기")
+        self.manual_toggle_btn.setMinimumHeight(34)
+        self.manual_toggle_btn.setMinimumWidth(170)
+        self.manual_toggle_btn.setStyleSheet(
+            "QPushButton {"
+            "background-color: #f8f6f0; color: #29352b; border: 1px solid #d6cec0; border-radius: 7px;"
+            "font-size: 14px; font-weight: 700; padding: 7px 18px;"
+            "}"
+            "QPushButton:hover { background-color: #eee7dc; }"
+            "QPushButton:pressed { background-color: #ded3c4; }"
+        )
+        self.manual_toggle_btn.clicked.connect(self.toggle_manual_upload)
+        manual_toggle_row.addStretch(1)
+        manual_toggle_row.addWidget(self.manual_toggle_btn)
+        manual_toggle_row.addStretch(1)
+        main.addLayout(manual_toggle_row)
 
         self.manual_actions_widget = QWidget()
         action_row = QHBoxLayout()
@@ -2289,6 +2419,7 @@ class MainWindow(QMainWindow):
         action_row.addStretch(1)
         self.manual_actions_widget.setLayout(action_row)
         self.manual_actions_widget.setVisible(False)
+        self.update_manual_toggle_text()
         main.addWidget(self.manual_actions_widget)
 
         clip_box = QGroupBox("설교 구간")
@@ -2323,6 +2454,7 @@ class MainWindow(QMainWindow):
         progress_layout = QVBoxLayout()
         progress_layout.addWidget(self.status_label)
         progress_layout.addWidget(self.progress_bar)
+        progress_layout.addWidget(self.stop_task_btn)
         progress_box.setLayout(progress_layout)
         main.addWidget(progress_box)
 
@@ -2388,6 +2520,22 @@ class MainWindow(QMainWindow):
     def toggle_manual_upload(self) -> None:
         if self.manual_actions_widget:
             self.manual_actions_widget.setVisible(not self.manual_actions_widget.isVisible())
+            self.update_manual_toggle_text()
+
+    def show_manual_actions(self) -> None:
+        if self.manual_actions_widget:
+            self.manual_actions_widget.setVisible(True)
+            self.update_manual_toggle_text()
+
+    def hide_manual_actions(self) -> None:
+        if self.manual_actions_widget:
+            self.manual_actions_widget.setVisible(False)
+            self.update_manual_toggle_text()
+
+    def update_manual_toggle_text(self) -> None:
+        if self.manual_toggle_btn and self.manual_actions_widget:
+            label = "수동 메뉴 접기" if self.manual_actions_widget.isVisible() else "수동 메뉴 펼치기"
+            self.manual_toggle_btn.setText(label)
 
     def show_error(self, title: str, body: str) -> None:
         QMessageBox.critical(self, title, body)
@@ -2404,11 +2552,13 @@ class MainWindow(QMainWindow):
         self.active_thread = worker
         self.set_status("Starting task...")
         self.set_progress(None)
+        self.stop_task_btn.setEnabled(True)
         worker.log.connect(self.log)
         worker.status.connect(self.set_status)
         worker.progress.connect(self.set_progress)
         worker.failed.connect(self.show_error)
         worker.failed.connect(lambda *_: self._finish_task("Failed."))
+        worker.cancelled.connect(lambda: self._finish_task("Stopped."))
         if on_success:
             worker.finished_ok.connect(on_success)
         worker.finished_ok.connect(lambda *_: self._finish_task("Done."))
@@ -2418,6 +2568,31 @@ class MainWindow(QMainWindow):
         self.set_status(status_message)
         self.set_progress(100, 100)
         self.active_thread = None
+        self.stop_task_btn.setEnabled(False)
+
+    def stop_current_task_for_manual(self) -> None:
+        if not self.active_thread or not self.active_thread.isRunning():
+            self.show_manual_actions()
+            self.set_status("Manual input mode.")
+            return
+        self.active_thread.requestInterruption()
+        self.active_thread.quit()
+        self.active_thread.wait(1500)
+        if self.active_thread and self.active_thread.isRunning():
+            self.active_thread.terminate()
+            self.active_thread.wait(1500)
+        self.active_thread = None
+        self.stop_task_btn.setEnabled(False)
+        self.show_manual_actions()
+        self.set_status("Stopped. Enter times manually, then export MP4.")
+        self.set_progress(100, 100)
+        self.log("Task stopped by user. Manual buttons are now available.")
+        self.show_info(
+            "수동 입력 모드",
+            "작업을 멈췄습니다.\n\n"
+            "풀영상 보기를 눌러 시간을 확인한 뒤 시작/종료 시간을 직접 입력하고 "
+            "3. Export Sermon MP4를 실행하세요.",
+        )
 
     def shift_time(self, widget: QLineEdit, delta_seconds: int) -> None:
         raw = widget.text().strip()
@@ -2428,22 +2603,56 @@ class MainWindow(QMainWindow):
         except ValueError:
             self.show_error("Invalid timecode", f"Could not parse timecode: {raw}")
 
-    def find_live_archive(self, service_order: str) -> None:
+    def manual_service(self, service_order: str) -> None:
         self.start_worker(
             lambda: self.engine.find_recent_live_archive(service_order),
             error_title="라이브 아카이브 찾기 실패",
-            on_success=self._after_find_live_archive,
+            on_success=self._after_manual_service,
         )
 
-    def _after_find_live_archive(self, candidate: YouTubeLiveCandidate) -> None:
-        self.url_edit.setText(candidate.url)
+    def _after_manual_service(self, candidate: YouTubeLiveCandidate) -> None:
+        if candidate.download_ready:
+            self.url_edit.setText(candidate.url)
+            self.show_manual_actions()
         self.log(f"Live archive selected: {candidate.url}")
-        message = f"URL 칸에 라이브 아카이브를 입력했습니다:\n{candidate.url}"
+        if candidate.download_ready:
+            message = (
+                f"다운로드 준비 완료. URL 칸에 입력했고 수동 작업 버튼을 펼쳤습니다:\n{candidate.url}\n\n"
+                "이제 1. Download Full Video부터 진행하면 됩니다."
+            )
+        else:
+            message = (
+                "아직 다운로드 준비가 안 됐습니다.\n\n"
+                f"후보 영상:\n{candidate.url}\n\n"
+                "나중에 다시 1부/2부 수동 작업을 눌러주세요."
+            )
         if candidate.title:
             message += f"\n\n라이브 제목: {candidate.title}"
         if candidate.processing_status and candidate.processing_status != "unknown":
             message += f"\n\nYouTube processing status: {candidate.processing_status}"
-        self.show_info("라이브 아카이브 찾기 완료", message)
+        if candidate.ready_reason:
+            message += f"\n\n확인 결과: {candidate.ready_reason}"
+        title = "다운로드 준비 완료" if candidate.download_ready else "아직 다운로드 준비 안 됨"
+        self.show_info(title, message)
+
+    def auto_service(self, service_order: str) -> None:
+        self.start_worker(
+            lambda: self._do_auto_service(service_order),
+            error_title="자동화 실패",
+            on_success=self._after_auto_upload,
+        )
+
+    def _do_auto_service(self, service_order: str):
+        candidate = self.engine.find_recent_live_archive(service_order)
+        if not candidate.download_ready:
+            label = "1부" if service_order == "first" else "2부"
+            raise RuntimeError(
+                f"{label} 예배는 아직 다운로드 준비가 안 됐습니다.\n\n"
+                f"후보 영상:\n{candidate.url}\n\n"
+                f"확인 결과: {candidate.ready_reason}"
+            )
+        self.task_log(f"Auto service URL ready: {candidate.url}")
+        return self._run_auto_pipeline(candidate.url)
 
     def download_video(self) -> None:
         self.start_worker(
@@ -2460,8 +2669,11 @@ class MainWindow(QMainWindow):
         )
 
     def _do_auto_upload(self):
+        return self._run_auto_pipeline(self.url_edit.text().strip())
+
+    def _run_auto_pipeline(self, url: str):
         result = self.engine.download_video(
-            url=self.url_edit.text().strip(),
+            url=url,
             title=self.title_edit.text().strip(),
             yt_dlp_path=self.engine.get_setting("yt_dlp_path"),
         )
@@ -2586,10 +2798,18 @@ class MainWindow(QMainWindow):
                 self.url_edit.text().strip(),
                 self.title_edit.text().strip(),
             )
-            candidates = sorted(
-                path for path in (DOWNLOADS_DIR / title_slug).glob("source.*")
-                if not path.name.endswith((".part", ".ytdl", ".temp"))
-            )
+            download_dir = DOWNLOADS_DIR / title_slug
+            candidates = []
+            if download_dir.exists():
+                candidates = sorted(
+                    (
+                        path for path in download_dir.iterdir()
+                        if path.is_file()
+                        and path.suffix.lower() in {".mp4", ".mkv", ".mov", ".webm", ".m4v"}
+                        and not path.name.endswith((".part", ".ytdl", ".temp"))
+                    ),
+                    key=lambda path: (0 if path.stem == "source" else 1, path.stat().st_mtime),
+                )
             source_file = candidates[0] if candidates else None
         if not source_file or not source_file.exists():
             self.show_error("풀영상 없음", "먼저 1. Download Full Video를 실행해 주세요.")
