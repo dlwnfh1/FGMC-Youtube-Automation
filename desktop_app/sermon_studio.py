@@ -1968,16 +1968,19 @@ class MainWindow(QMainWindow):
         self.manual_actions_widget = QWidget()
         action_row = QHBoxLayout()
         download_btn = QPushButton("1. Download Full Video")
+        choose_local_btn = QPushButton("로컬 영상 선택")
         detect_btn = QPushButton("2. Auto Detect Sermon Range")
         detect_skip_btn = QPushButton("2b. Reuse Transcript Only")
         export_btn = QPushButton("3. Export Sermon MP4")
         open_full_btn = QPushButton("풀영상 보기")
         download_btn.clicked.connect(self.download_video)
+        choose_local_btn.clicked.connect(self.choose_local_video)
         detect_btn.clicked.connect(self.auto_detect)
         detect_skip_btn.clicked.connect(self.auto_detect_skip_transcription)
         export_btn.clicked.connect(self.export_clip)
         open_full_btn.clicked.connect(self.open_full_video)
         action_row.addWidget(download_btn)
+        action_row.addWidget(choose_local_btn)
         action_row.addWidget(open_full_btn)
         action_row.addWidget(detect_btn)
         action_row.addWidget(detect_skip_btn)
@@ -2222,6 +2225,30 @@ class MainWindow(QMainWindow):
         self.duration_edit.setText(duration)
         self.log(f"Downloaded file: {result.source_file}")
         self.show_info("Done", "Full service video download finished.")
+
+    def choose_local_video(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "풀영상 파일 선택",
+            "",
+            "Video files (*.mp4 *.mkv *.mov *.webm *.m4v);;All files (*.*)",
+        )
+        if not selected:
+            return
+        source_file = Path(selected)
+        if not source_file.exists():
+            self.show_error("파일 없음", f"선택한 파일을 찾을 수 없습니다:\n{source_file}")
+            return
+        self.current_source_file = source_file
+        self.current_title_slug = slugify(self.title_edit.text().strip() or source_file.stem)
+        try:
+            duration = self.engine.get_media_duration(source_file, self.engine.get_setting("ffmpeg_path"))
+            self.duration_edit.setText(duration)
+        except Exception as exc:
+            self.duration_edit.setText("-")
+            self.log(f"Could not read local video duration: {exc}")
+        self.log(f"Selected local full video: {source_file}")
+        self.show_info("Done", "로컬 풀영상이 선택되었습니다. 이제 시간을 직접 입력하거나 Auto Detect를 실행할 수 있습니다.")
 
     def open_full_video(self) -> None:
         source_file = self.current_source_file

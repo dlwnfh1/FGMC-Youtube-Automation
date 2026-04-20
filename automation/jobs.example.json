@@ -1,0 +1,13 @@
+{
+  "jobs": [
+    {
+      "title": "Easter Sermon",
+      "speaker": "Pastor Kim",
+      "date": "2026-04-12",
+      "source_url": "https://www.youtube.com/watch?v=REPLACE_ME",
+      "start": "00:31:40",
+      "end": "01:18:10",
+      "browser": "chrome"
+    }
+  ]
+}
