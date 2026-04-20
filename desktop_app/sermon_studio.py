@@ -1725,6 +1725,47 @@ class SermonStudioEngine:
         run_command(command)
         return destination
 
+    def resize_mp4(
+        self,
+        source_file: Path,
+        width_text: str,
+        height_text: str,
+        ffmpeg_path: str,
+    ) -> Path:
+        width = int(width_text.strip())
+        height = int(height_text.strip())
+        if width <= 0 or height <= 0:
+            raise ValueError("Width and height must be positive numbers.")
+
+        ffmpeg_bin = resolve_binary("ffmpeg", ffmpeg_path)
+        destination = source_file.with_name(f"{source_file.stem}-{width}x{height}.mp4")
+        command = [
+            ffmpeg_bin,
+            "-y",
+            "-i",
+            str(source_file),
+            "-vf",
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "22",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-movflags",
+            "+faststart",
+            str(destination),
+        ]
+        self.status(f"Resizing MP4 to {width}x{height}...")
+        self.progress(None)
+        self.log(f"Resizing MP4 to {width}x{height}: {source_file}")
+        run_command(command)
+        return destination
+
     def create_review_clip(
         self,
         source_file: Path,
@@ -1888,6 +1929,7 @@ class MainWindow(QMainWindow):
         self.resize(980, 760)
         self.engine = SermonStudioEngine(self.log)
         self.current_source_file: Path | None = None
+        self.last_export_file: Path | None = None
         self.current_title_slug = ""
         self.active_thread: WorkerThread | None = None
 
@@ -1901,6 +1943,8 @@ class MainWindow(QMainWindow):
         self.start_edit = QLineEdit()
         self.end_edit = QLineEdit()
         self.review_seconds_edit = QLineEdit("5")
+        self.resize_width_edit = QLineEdit("1280")
+        self.resize_height_edit = QLineEdit("720")
         self.status_label = QLabel("Ready.")
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
@@ -2002,11 +2046,18 @@ class MainWindow(QMainWindow):
         clip_grid.addWidget(self.end_edit, 1, 3)
         clip_grid.addWidget(QLabel("리뷰 초"), 2, 0)
         clip_grid.addWidget(self.review_seconds_edit, 2, 1)
+        clip_grid.addWidget(QLabel("MP4 가로"), 2, 2)
+        clip_grid.addWidget(self.resize_width_edit, 2, 3)
+        clip_grid.addWidget(QLabel("MP4 세로"), 3, 0)
+        clip_grid.addWidget(self.resize_height_edit, 3, 1)
+        resize_btn = QPushButton("MP4 사이즈 변경")
+        resize_btn.clicked.connect(self.resize_exported_mp4)
+        clip_grid.addWidget(resize_btn, 3, 2, 1, 2)
 
         start_controls = self._adjust_controls(self.start_edit, self.review_start, "Review Start")
         end_controls = self._adjust_controls(self.end_edit, self.review_end, "Review End")
-        clip_grid.addLayout(start_controls, 3, 0, 1, 2)
-        clip_grid.addLayout(end_controls, 3, 2, 1, 2)
+        clip_grid.addLayout(start_controls, 4, 0, 1, 2)
+        clip_grid.addLayout(end_controls, 4, 2, 1, 2)
         clip_box.setLayout(clip_grid)
         main.addWidget(clip_box)
 
@@ -2207,6 +2258,7 @@ class MainWindow(QMainWindow):
         self.log(f"Downloaded file: {result.source_file}")
         self.log(f"Transcript saved: {transcript_path}")
         self.log(f"Exported file: {destination}")
+        self.last_export_file = destination
         self.show_info("Done", f"MP4 생성 완료:\n{destination}")
 
     def _do_download(self):
@@ -2455,8 +2507,41 @@ class MainWindow(QMainWindow):
         )
 
     def _after_export(self, destination: Path) -> None:
+        self.last_export_file = destination
         self.log(f"Exported file: {destination}")
         self.show_info("Done", f"Sermon MP4 saved to:\n{destination}")
+
+    def resize_exported_mp4(self) -> None:
+        source_file = self.last_export_file
+        if not source_file or not source_file.exists():
+            selected, _ = QFileDialog.getOpenFileName(
+                self,
+                "리사이즈할 MP4 선택",
+                str(EXPORTS_DIR),
+                "MP4 files (*.mp4);;All files (*.*)",
+            )
+            if not selected:
+                return
+            source_file = Path(selected)
+        self.start_worker(
+            self._do_resize_exported_mp4,
+            source_file,
+            error_title="MP4 사이즈 변경 실패",
+            on_success=self._after_resize_exported_mp4,
+        )
+
+    def _do_resize_exported_mp4(self, source_file: Path):
+        return self.engine.resize_mp4(
+            source_file=source_file,
+            width_text=self.resize_width_edit.text().strip() or "1280",
+            height_text=self.resize_height_edit.text().strip() or "720",
+            ffmpeg_path=self.engine.get_setting("ffmpeg_path"),
+        )
+
+    def _after_resize_exported_mp4(self, destination: Path) -> None:
+        self.last_export_file = destination
+        self.log(f"Resized MP4 saved: {destination}")
+        self.show_info("Done", f"사이즈 변경 MP4 저장 완료:\n{destination}")
 
 
 def main() -> int:
