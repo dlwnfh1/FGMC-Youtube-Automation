@@ -19,6 +19,7 @@ import tempfile
 import wave
 import winreg
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -28,6 +29,7 @@ from PySide6.QtGui import QFont, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
+    QCheckBox,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -70,6 +72,7 @@ TRANSCRIPT_DIR = WORK_DIR / "transcripts"
 FRAME_DIR = WORK_DIR / "frames"
 REVIEW_DIR = WORK_DIR / "review_clips"
 SETTINGS_PATH = WORK_DIR / "settings.json"
+YOUTUBE_TOKEN_PATH = WORK_DIR / "youtube_token.json"
 
 DEFAULT_MARKERS = [
     "\ub2e4\ud568\uaed8 \uae30\ub3c4 \ub4dc\ub9ac\uaca0\uc2b5\ub2c8\ub2e4",
@@ -231,6 +234,26 @@ def normalize_search_text(value: str) -> str:
 def contains_marker(text: str, markers: list[str]) -> bool:
     normalized_text = normalize_search_text(text)
     return any(normalize_search_text(marker) in normalized_text for marker in markers)
+
+
+def parse_ffmpeg_progress_seconds(line: str) -> float | None:
+    if line.startswith("out_time_ms="):
+        try:
+            return max(0.0, float(line.split("=", 1)[1]) / 1_000_000.0)
+        except ValueError:
+            return None
+    if line.startswith("out_time_us="):
+        try:
+            return max(0.0, float(line.split("=", 1)[1]) / 1_000_000.0)
+        except ValueError:
+            return None
+    if line.startswith("out_time="):
+        raw_value = line.split("=", 1)[1].strip()
+        try:
+            return parse_timecode(raw_value)
+        except ValueError:
+            return None
+    return None
 
 
 def slugify(value: str) -> str:
@@ -397,6 +420,18 @@ class DownloadResult:
 
 
 @dataclass
+class YouTubeLiveCandidate:
+    video_id: str
+    title: str
+    actual_end_time: str
+    processing_status: str
+
+    @property
+    def url(self) -> str:
+        return f"https://www.youtube.com/watch?v={self.video_id}"
+
+
+@dataclass
 class StartCandidate:
     score: int
     time_seconds: float
@@ -477,6 +512,123 @@ class SermonStudioEngine:
                 saved_value, _ = winreg.QueryValueEx(key_handle, "OPENAI_API_KEY")
             if saved_value != api_key:
                 raise RuntimeError("OPENAI_API_KEY was not saved to Windows user environment.")
+
+    def _parse_youtube_time(self, value: str) -> datetime:
+        if not value:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+    def get_youtube_service(self):
+        client_secrets_path = self.get_setting("youtube_client_secrets_path")
+        if not client_secrets_path:
+            raise ValueError(
+                "YouTube 계정 연결이 필요합니다.\n\n"
+                "설정에서 Google OAuth client secrets JSON 파일 경로를 먼저 지정해 주세요."
+            )
+        if not Path(client_secrets_path).exists():
+            raise FileNotFoundError(f"Google OAuth client secrets JSON 파일을 찾을 수 없습니다:\n{client_secrets_path}")
+
+        try:
+            from google.auth.transport.requests import Request
+            from google.oauth2.credentials import Credentials
+            from google_auth_oauthlib.flow import InstalledAppFlow
+            from googleapiclient.discovery import build
+        except ImportError as exc:
+            raise RuntimeError(
+                "YouTube API 라이브러리가 설치되어 있지 않습니다. "
+                "패키지를 다시 빌드하거나 requirements를 설치해야 합니다."
+            ) from exc
+
+        scopes = ["https://www.googleapis.com/auth/youtube.readonly"]
+        credentials = None
+        if YOUTUBE_TOKEN_PATH.exists():
+            credentials = Credentials.from_authorized_user_file(str(YOUTUBE_TOKEN_PATH), scopes)
+        if credentials and credentials.expired and credentials.refresh_token:
+            credentials.refresh(Request())
+        if not credentials or not credentials.valid:
+            self.status("Opening Google login for YouTube access...")
+            flow = InstalledAppFlow.from_client_secrets_file(str(client_secrets_path), scopes)
+            credentials = flow.run_local_server(port=0, prompt="consent")
+        YOUTUBE_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        YOUTUBE_TOKEN_PATH.write_text(credentials.to_json(), encoding="utf-8")
+        return build("youtube", "v3", credentials=credentials)
+
+    def find_recent_live_archive(self, service_order: str) -> YouTubeLiveCandidate:
+        if service_order not in {"first", "second"}:
+            raise ValueError("service_order must be 'first' or 'second'.")
+
+        service = self.get_youtube_service()
+        label = "1부" if service_order == "first" else "2부"
+        self.status(f"Finding recent completed live archive for {label}...")
+        self.progress(None)
+
+        response = service.liveBroadcasts().list(
+            part="id,snippet,status",
+            mine=True,
+            broadcastStatus="completed",
+            maxResults=10,
+        ).execute()
+        items = response.get("items", [])
+        if len(items) < 1:
+            raise RuntimeError("완료된 라이브 방송을 찾지 못했습니다.")
+
+        def sort_key(item: dict[str, Any]) -> datetime:
+            snippet = item.get("snippet", {})
+            return self._parse_youtube_time(
+                snippet.get("actualEndTime")
+                or snippet.get("actualStartTime")
+                or snippet.get("scheduledStartTime")
+                or snippet.get("publishedAt")
+                or ""
+            )
+
+        items.sort(key=sort_key, reverse=True)
+        index = 1 if service_order == "first" else 0
+        if len(items) <= index:
+            raise RuntimeError(f"{label} 예배 후보를 찾기에는 완료된 라이브가 부족합니다.")
+
+        selected = items[index]
+        video_id = str(selected.get("id", "")).strip()
+        snippet = selected.get("snippet", {})
+        title = str(snippet.get("title", "")).strip()
+        actual_end_time = str(
+            snippet.get("actualEndTime")
+            or snippet.get("actualStartTime")
+            or snippet.get("scheduledStartTime")
+            or ""
+        )
+        if not video_id:
+            raise RuntimeError("선택된 라이브에서 YouTube video ID를 찾지 못했습니다.")
+
+        processing_status = "unknown"
+        try:
+            video_response = service.videos().list(
+                part="processingDetails,status,snippet",
+                id=video_id,
+            ).execute()
+            video_items = video_response.get("items", [])
+            if video_items:
+                processing_status = str(
+                    video_items[0].get("processingDetails", {}).get("processingStatus", "unknown")
+                )
+        except Exception as exc:
+            self.log(f"Could not read YouTube processing status: {exc}")
+
+        candidate = YouTubeLiveCandidate(
+            video_id=video_id,
+            title=title,
+            actual_end_time=actual_end_time,
+            processing_status=processing_status,
+        )
+        self.log(
+            f"{label} live archive candidate: {candidate.url} | "
+            f"title={candidate.title} | processing={candidate.processing_status}"
+        )
+        self.progress(100, 100)
+        return candidate
 
     def set_callbacks(self, log_callback, status_callback, progress_callback) -> None:
         self.log = log_callback
@@ -1688,6 +1840,8 @@ class SermonStudioEngine:
         start_text: str,
         end_text: str,
         ffmpeg_path: str,
+        fade_out_enabled: bool = True,
+        fade_out_seconds_text: str = "3",
     ) -> Path:
         start_seconds = parse_timecode(start_text)
         end_seconds = parse_timecode(end_text)
@@ -1696,6 +1850,14 @@ class SermonStudioEngine:
 
         ffmpeg_bin = resolve_binary("ffmpeg", ffmpeg_path)
         destination = EXPORTS_DIR / f"{slugify(title or 'sermon')}.mp4"
+        duration_seconds = end_seconds - start_seconds
+        fade_out_seconds = 0.0
+        if fade_out_enabled:
+            fade_out_seconds = float(fade_out_seconds_text.strip() or "3")
+            if fade_out_seconds < 0:
+                raise ValueError("Fade-out seconds must be zero or a positive number.")
+            fade_out_seconds = min(fade_out_seconds, max(0.0, duration_seconds - 0.5))
+
         command = [
             ffmpeg_bin,
             "-y",
@@ -1705,65 +1867,123 @@ class SermonStudioEngine:
             format_timestamp(start_seconds),
             "-to",
             format_timestamp(end_seconds),
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "18",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-movflags",
-            "+faststart",
-            str(destination),
         ]
+        if fade_out_seconds > 0:
+            fade_start = max(0.0, duration_seconds - fade_out_seconds)
+            command.extend(
+                [
+                    "-vf",
+                    f"setpts=PTS-STARTPTS,fade=t=out:st={fade_start:.3f}:d={fade_out_seconds:.3f}",
+                    "-af",
+                    f"asetpts=PTS-STARTPTS,afade=t=out:st={fade_start:.3f}:d={fade_out_seconds:.3f}",
+                ]
+            )
+        command.extend(
+            [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "18",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-movflags",
+                "+faststart",
+                "-progress",
+                "pipe:1",
+                "-nostats",
+                str(destination),
+            ]
+        )
         self.status("Exporting sermon MP4...")
-        self.progress(None)
-        self.log("Exporting sermon MP4...")
-        run_command(command)
+        self.progress(0, 100)
+        if fade_out_seconds > 0:
+            self.log(f"Exporting sermon MP4 with {fade_out_seconds:g}s fade-out...")
+        else:
+            self.log("Exporting sermon MP4...")
+
+        def handle_export_progress(line: str) -> None:
+            progress_seconds = parse_ffmpeg_progress_seconds(line)
+            if progress_seconds is None:
+                return
+            percent = min(100, max(0, int((progress_seconds / duration_seconds) * 100)))
+            self.status(f"Exporting sermon MP4... {percent}%")
+            self.progress(percent, 100)
+
+        run_command_streaming(command, handle_export_progress)
+        self.progress(100, 100)
         return destination
 
     def resize_mp4(
         self,
         source_file: Path,
-        width_text: str,
-        height_text: str,
+        target_mb_text: str,
         ffmpeg_path: str,
     ) -> Path:
-        width = int(width_text.strip())
-        height = int(height_text.strip())
-        if width <= 0 or height <= 0:
-            raise ValueError("Width and height must be positive numbers.")
+        target_mb = float(target_mb_text.strip())
+        if target_mb <= 0:
+            raise ValueError("Target file size must be a positive number.")
 
         ffmpeg_bin = resolve_binary("ffmpeg", ffmpeg_path)
-        destination = source_file.with_name(f"{source_file.stem}-{width}x{height}.mp4")
+        destination = source_file.with_name(f"{source_file.stem}-{int(target_mb)}mb.mp4")
+        try:
+            duration_seconds = parse_timecode(self.get_media_duration(source_file, ffmpeg_path))
+        except Exception:
+            duration_seconds = 0.0
+        if duration_seconds <= 0:
+            raise ValueError("Could not read the MP4 duration for target-size conversion.")
+
+        audio_kbps = 128
+        total_kbps = int((target_mb * 1024 * 8) / duration_seconds)
+        video_kbps = max(300, total_kbps - audio_kbps)
+        if video_kbps <= 300 and total_kbps <= audio_kbps + 300:
+            self.log(
+                f"Target size {target_mb:g}MB is very small for {format_seconds(duration_seconds)}; "
+                "using minimum video bitrate."
+            )
+
         command = [
             ffmpeg_bin,
             "-y",
             "-i",
             str(source_file),
-            "-vf",
-            f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
             "-c:v",
             "libx264",
             "-preset",
             "medium",
-            "-crf",
-            "22",
+            "-b:v",
+            f"{video_kbps}k",
             "-c:a",
             "aac",
             "-b:a",
-            "160k",
+            f"{audio_kbps}k",
             "-movflags",
             "+faststart",
+            "-progress",
+            "pipe:1",
+            "-nostats",
             str(destination),
         ]
-        self.status(f"Resizing MP4 to {width}x{height}...")
-        self.progress(None)
-        self.log(f"Resizing MP4 to {width}x{height}: {source_file}")
-        run_command(command)
+        self.status(f"Reducing MP4 near {target_mb:g}MB...")
+        self.progress(0, 100)
+        self.log(
+            f"Reducing MP4 near {target_mb:g}MB: {source_file} "
+            f"(video {video_kbps}k, audio {audio_kbps}k)"
+        )
+
+        def handle_resize_progress(line: str) -> None:
+            progress_seconds = parse_ffmpeg_progress_seconds(line)
+            if progress_seconds is None or duration_seconds <= 0:
+                return
+            percent = min(100, max(0, int((progress_seconds / duration_seconds) * 100)))
+            self.status(f"Reducing MP4 near {target_mb:g}MB... {percent}%")
+            self.progress(percent, 100)
+
+        run_command_streaming(command, handle_resize_progress)
+        self.progress(100, 100)
         return destination
 
     def create_review_clip(
@@ -1842,6 +2062,7 @@ class SettingsDialog(QDialog):
 
         self.yt_dlp_edit = QLineEdit(engine.get_setting("yt_dlp_path"))
         self.ffmpeg_edit = QLineEdit(engine.get_setting("ffmpeg_path"))
+        self.youtube_client_secrets_edit = QLineEdit(engine.get_setting("youtube_client_secrets_path"))
         self.api_key_edit = QLineEdit()
         if engine.get_setting("openai_api_key"):
             self.api_key_edit.setPlaceholderText("OPENAI_API_KEY is already saved in Windows")
@@ -1858,6 +2079,7 @@ class SettingsDialog(QDialog):
         form = QFormLayout()
         form.addRow("yt-dlp path", self._with_browse(self.yt_dlp_edit))
         form.addRow("ffmpeg path", self._with_browse(self.ffmpeg_edit))
+        form.addRow("YouTube OAuth JSON", self._with_browse_json(self.youtube_client_secrets_edit))
         form.addRow("OpenAI API key", self.api_key_edit)
         form.addRow("Transcription model", self.transcription_model_edit)
         form.addRow("Language code", self.language_edit)
@@ -1866,7 +2088,8 @@ class SettingsDialog(QDialog):
 
         note = QLabel(
             "ffmpeg.exe 와 yt-dlp.exe 가 이 프로그램과 같은 폴더 또는 옆의 tools 폴더에 있으면 자동으로 찾습니다.\n"
-            "OpenAI API key 는 settings.json 에 저장하지 않고 Windows 사용자 환경변수 OPENAI_API_KEY 로 저장합니다."
+            "OpenAI API key 는 settings.json 에 저장하지 않고 Windows 사용자 환경변수 OPENAI_API_KEY 로 저장합니다.\n"
+            "YouTube OAuth JSON은 Google Cloud에서 받은 데스크톱 앱용 client secrets 파일입니다."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #555;")
@@ -1893,8 +2116,28 @@ class SettingsDialog(QDialog):
         row.addWidget(browse)
         return wrapper
 
+    def _with_browse_json(self, line_edit: QLineEdit) -> QWidget:
+        wrapper = QWidget()
+        row = QHBoxLayout(wrapper)
+        row.setContentsMargins(0, 0, 0, 0)
+        browse = QPushButton("Browse")
+        browse.clicked.connect(lambda: self._browse_json(line_edit))
+        row.addWidget(line_edit)
+        row.addWidget(browse)
+        return wrapper
+
     def _browse(self, line_edit: QLineEdit) -> None:
         selected, _ = QFileDialog.getOpenFileName(self, "실행 파일 선택", "", "Executable (*.exe)")
+        if selected:
+            line_edit.setText(selected)
+
+    def _browse_json(self, line_edit: QLineEdit) -> None:
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Google OAuth JSON 선택",
+            "",
+            "JSON files (*.json);;All files (*.*)",
+        )
         if selected:
             line_edit.setText(selected)
 
@@ -1912,6 +2155,7 @@ class SettingsDialog(QDialog):
             {
                 "yt_dlp_path": self.yt_dlp_edit.text().strip(),
                 "ffmpeg_path": self.ffmpeg_edit.text().strip(),
+                "youtube_client_secrets_path": self.youtube_client_secrets_edit.text().strip(),
                 "transcription_model": self.transcription_model_edit.text().strip() or "whisper-1",
                 "language": self.language_edit.text().strip() or "ko",
                 "vision_model": self.vision_model_edit.text().strip() or "gpt-4.1-mini",
@@ -1943,8 +2187,10 @@ class MainWindow(QMainWindow):
         self.start_edit = QLineEdit()
         self.end_edit = QLineEdit()
         self.review_seconds_edit = QLineEdit("5")
-        self.resize_width_edit = QLineEdit("1280")
-        self.resize_height_edit = QLineEdit("720")
+        self.fade_out_check = QCheckBox("끝부분 자연스럽게 마무리")
+        self.fade_out_check.setChecked(True)
+        self.fade_out_seconds_edit = QLineEdit("3")
+        self.target_size_mb_edit = QLineEdit("100")
         self.status_label = QLabel("Ready.")
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
@@ -1977,6 +2223,17 @@ class MainWindow(QMainWindow):
         info_form.addRow("날짜", self.date_edit)
         info_box.setLayout(info_form)
         main.addWidget(info_box)
+
+        live_row = QHBoxLayout()
+        find_first_live_btn = QPushButton("1부 예배 찾기")
+        find_second_live_btn = QPushButton("2부 예배 찾기")
+        find_first_live_btn.clicked.connect(lambda: self.find_live_archive("first"))
+        find_second_live_btn.clicked.connect(lambda: self.find_live_archive("second"))
+        live_row.addStretch(1)
+        live_row.addWidget(find_first_live_btn)
+        live_row.addWidget(find_second_live_btn)
+        live_row.addStretch(1)
+        main.addLayout(live_row)
 
         mode_row = QHBoxLayout()
         auto_btn = QPushButton("자동 업로드")
@@ -2046,13 +2303,14 @@ class MainWindow(QMainWindow):
         clip_grid.addWidget(self.end_edit, 1, 3)
         clip_grid.addWidget(QLabel("리뷰 초"), 2, 0)
         clip_grid.addWidget(self.review_seconds_edit, 2, 1)
-        clip_grid.addWidget(QLabel("MP4 가로"), 2, 2)
-        clip_grid.addWidget(self.resize_width_edit, 2, 3)
-        clip_grid.addWidget(QLabel("MP4 세로"), 3, 0)
-        clip_grid.addWidget(self.resize_height_edit, 3, 1)
-        resize_btn = QPushButton("MP4 사이즈 변경")
+        clip_grid.addWidget(QLabel("목표 파일 크기(MB)"), 2, 2)
+        clip_grid.addWidget(self.target_size_mb_edit, 2, 3)
+        clip_grid.addWidget(self.fade_out_check, 3, 0)
+        clip_grid.addWidget(QLabel("페이드아웃 초"), 3, 1)
+        clip_grid.addWidget(self.fade_out_seconds_edit, 3, 2)
+        resize_btn = QPushButton("목표 크기로 줄이기")
         resize_btn.clicked.connect(self.resize_exported_mp4)
-        clip_grid.addWidget(resize_btn, 3, 2, 1, 2)
+        clip_grid.addWidget(resize_btn, 3, 3)
 
         start_controls = self._adjust_controls(self.start_edit, self.review_start, "Review Start")
         end_controls = self._adjust_controls(self.end_edit, self.review_end, "Review End")
@@ -2170,6 +2428,23 @@ class MainWindow(QMainWindow):
         except ValueError:
             self.show_error("Invalid timecode", f"Could not parse timecode: {raw}")
 
+    def find_live_archive(self, service_order: str) -> None:
+        self.start_worker(
+            lambda: self.engine.find_recent_live_archive(service_order),
+            error_title="라이브 아카이브 찾기 실패",
+            on_success=self._after_find_live_archive,
+        )
+
+    def _after_find_live_archive(self, candidate: YouTubeLiveCandidate) -> None:
+        self.url_edit.setText(candidate.url)
+        self.log(f"Live archive selected: {candidate.url}")
+        message = f"URL 칸에 라이브 아카이브를 입력했습니다:\n{candidate.url}"
+        if candidate.title:
+            message += f"\n\n라이브 제목: {candidate.title}"
+        if candidate.processing_status and candidate.processing_status != "unknown":
+            message += f"\n\nYouTube processing status: {candidate.processing_status}"
+        self.show_info("라이브 아카이브 찾기 완료", message)
+
     def download_video(self) -> None:
         self.start_worker(
             self._do_download,
@@ -2243,6 +2518,8 @@ class MainWindow(QMainWindow):
             start_text=start_text,
             end_text=end_text,
             ffmpeg_path=self.engine.get_setting("ffmpeg_path"),
+            fade_out_enabled=self.fade_out_check.isChecked(),
+            fade_out_seconds_text=self.fade_out_seconds_edit.text().strip() or "3",
         )
         return result, duration, transcript_path, start_text, end_text, suggested_title, destination
 
@@ -2504,6 +2781,8 @@ class MainWindow(QMainWindow):
             start_text=self.start_edit.text().strip(),
             end_text=self.end_edit.text().strip(),
             ffmpeg_path=self.engine.get_setting("ffmpeg_path"),
+            fade_out_enabled=self.fade_out_check.isChecked(),
+            fade_out_seconds_text=self.fade_out_seconds_edit.text().strip() or "3",
         )
 
     def _after_export(self, destination: Path) -> None:
@@ -2533,8 +2812,7 @@ class MainWindow(QMainWindow):
     def _do_resize_exported_mp4(self, source_file: Path):
         return self.engine.resize_mp4(
             source_file=source_file,
-            width_text=self.resize_width_edit.text().strip() or "1280",
-            height_text=self.resize_height_edit.text().strip() or "720",
+            target_mb_text=self.target_size_mb_edit.text().strip() or "100",
             ffmpeg_path=self.engine.get_setting("ffmpeg_path"),
         )
 
